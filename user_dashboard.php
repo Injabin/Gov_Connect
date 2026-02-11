@@ -10,29 +10,36 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'user') {
 $user_id = $_SESSION['user_id'];
 $user_name = $_SESSION['name'] ?? 'Citizen';
 
-// --- 1. HANDLE SOS SUBMISSION (REAL GPS) ---
+// --- HANDLE SOS SUBMISSION (REAL GPS) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'sos') {
     header('Content-Type: application/json');
     try {
-        $lat = $_POST['lat'];
-        $lng = $_POST['lng'];
+        $lat = floatval($_POST['lat'] ?? 0);
+        $lng = floatval($_POST['lng'] ?? 0);
         
         if(empty($lat) || empty($lng)) {
             throw new Exception("GPS location required.");
         }
 
-        $stmt = $pdo->prepare("INSERT INTO problems (user_id, category, description, latitude, longitude, status, created_at) VALUES (?, 'SOS', 'EMERGENCY SOS ALERT', ?, ?, 'pending', NOW())");
+        $stmt = $pdo->prepare("INSERT INTO problems (user_id, category, description, latitude, longitude, status, priority, created_at) VALUES (?, 'SOS', 'EMERGENCY SOS ALERT - Immediate assistance required', ?, ?, 'pending', 'high', NOW())");
         $stmt->execute([$user_id, $lat, $lng]);
+        
+        // Log in logs table if exists
+        try {
+            $logStmt = $pdo->prepare("INSERT INTO logs (problem_id, user_id, notification_type, message, created_at) VALUES (LAST_INSERT_ID(), ?, 'SOS', 'Emergency SOS alert triggered', NOW())");
+            $logStmt->execute([$user_id]);
+        } catch(Exception $e) {}
         
         echo json_encode(['status' => 'success']);
         exit;
     } catch (Exception $e) {
+        http_response_code(500);
         echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
         exit;
     }
 }
 
-// --- 2. FETCH PROFILE PIC ---
+// --- FETCH PROFILE PIC ---
 $user_pic = null;
 $has_pic = false;
 try {
@@ -46,7 +53,7 @@ try {
     }
 } catch (Exception $e) { }
 
-// --- 3. FETCH REPORTS & STATS ---
+// --- FETCH REPORTS & STATS ---
 $reports = [];
 $stats = ['total' => 0, 'sos' => 0, 'resolved' => 0];
 $chartData = [0, 0, 0, 0, 0]; 
@@ -58,18 +65,22 @@ try {
     $reportsStmt->execute(['user_id' => $user_id]);
     $reports = $reportsStmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Calculate Stats
+    // Calculate Stats from ALL reports
     $fullStmt = $pdo->prepare("SELECT category, status FROM problems WHERE user_id = ?");
     $fullStmt->execute([$user_id]);
     $all = $fullStmt->fetchAll(PDO::FETCH_ASSOC);
 
     foreach ($all as $r) {
         $stats['total']++;
-        $cat = ucfirst($r['category']);
+        $cat = strtolower($r['category']);
         $status = strtolower($r['status']);
 
-        if (strtoupper($cat) === 'SOS') $stats['sos']++;
+        // Count SOS
+        if ($cat === 'sos') {
+            $stats['sos']++;
+        }
         
+        // Count Resolved
         if ($status === 'resolved') {
             $stats['resolved']++;
             $total_xp += 50; 
@@ -77,34 +88,107 @@ try {
             $total_xp += 10;
         }
         
-        // Chart Logic
-        if($cat == 'Traffic') $chartData[0]++;
-        elseif($cat == 'Water') $chartData[1]++;
-        elseif($cat == 'Waste') $chartData[2]++;
-        elseif(strtoupper($cat) == 'SOS') $chartData[3]++;
-        else $chartData[4]++;
+        // Chart Data - using lowercase for comparison
+        if($cat === 'traffic') {
+            $chartData[0]++;
+        } elseif($cat === 'water') {
+            $chartData[1]++;
+        } elseif($cat === 'waste') {
+            $chartData[2]++;
+        } elseif($cat === 'sos') {
+            $chartData[3]++;
+        } else {
+            $chartData[4]++;
+        }
     }
-} catch (Exception $e) { }
+} catch (Exception $e) { 
+    error_log("Error fetching reports: " . $e->getMessage());
+}
 
-// --- 4. FETCH MAP DATA (Real DB Data) ---
+// --- FETCH MAP DATA (Real DB Data - Active problems only) ---
 $mapReports = [];
 try {
-    $mapStmt = $pdo->prepare("SELECT latitude, longitude, category, status, created_at FROM problems WHERE latitude IS NOT NULL AND status != 'resolved' LIMIT 50");
+    $mapStmt = $pdo->prepare("
+        SELECT latitude, longitude, category, status, created_at 
+        FROM problems 
+        WHERE latitude IS NOT NULL 
+        AND longitude IS NOT NULL
+        AND status NOT IN ('resolved', 'rejected')
+        ORDER BY created_at DESC
+        LIMIT 100
+    ");
     $mapStmt->execute();
     $mapReports = $mapStmt->fetchAll(PDO::FETCH_ASSOC);
-} catch (Exception $e) { }
+} catch (Exception $e) { 
+    error_log("Error fetching map data: " . $e->getMessage());
+}
 
-// --- 5. REAL TICKER DATA ---
+// --- REAL TICKER DATA FROM DATABASE ---
 $ticker_news = [];
 try {
-    $newsStmt = $pdo->query("SELECT category, description FROM problems WHERE status = 'resolved' ORDER BY updated_at DESC LIMIT 5");
-    while($row = $newsStmt->fetch(PDO::FETCH_ASSOC)) {
-        $ticker_news[] = "✅ Solved: " . ucfirst($row['category']) . " issue - " . htmlspecialchars(substr($row['description'], 0, 40)) . "...";
+    // Get recently resolved issues
+    $newsStmt = $pdo->prepare("
+        SELECT category, location_name, updated_at 
+        FROM problems 
+        WHERE status = 'resolved' 
+        ORDER BY updated_at DESC 
+        LIMIT 8
+    ");
+    $newsStmt->execute();
+    $resolved = $newsStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    foreach($resolved as $item) {
+        $location = !empty($item['location_name']) ? $item['location_name'] : 'Dhaka area';
+        $ticker_news[] = "✅ Solved: " . ucfirst($item['category']) . " issue in " . $location;
     }
-} catch(Exception $e) {}
+    
+    // Add citywide stats
+    $pendingStmt = $pdo->query("SELECT COUNT(*) as cnt FROM problems WHERE status = 'pending'");
+    $pendingCount = $pendingStmt->fetch(PDO::FETCH_ASSOC)['cnt'];
+    $ticker_news[] = "⚡ " . $pendingCount . " reports pending verification citywide";
+    
+    // Add active SOS alerts
+    $sosStmt = $pdo->query("SELECT COUNT(*) as cnt FROM problems WHERE category = 'SOS' AND status = 'pending' AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)");
+    $activeSOS = $sosStmt->fetch(PDO::FETCH_ASSOC)['cnt'];
+    if ($activeSOS > 0) {
+        $ticker_news[] = "🚨 " . $activeSOS . " active emergency alerts in last 24 hours";
+    }
+    
+} catch(Exception $e) {
+    error_log("Error fetching news: " . $e->getMessage());
+}
 
+// Fallback if no data
 if(empty($ticker_news)) {
-    $ticker_news = ["⚡ Grid system operating normally.", "📢 Report any issues immediately.", "🌧️ Check weather updates before travel."];
+    $ticker_news = [
+        "⚡ Grid system operating normally.", 
+        "📢 Report any issues immediately.", 
+        "🌧️ Check weather updates before travel."
+    ];
+}
+
+// --- FETCH GOVERNMENT NOTICES FROM DATABASE ---
+$gov_notice = null;
+try {
+    $noticeStmt = $pdo->prepare("
+        SELECT message, created_at 
+        FROM warnings 
+        WHERE user_id IS NULL OR user_id = ?
+        ORDER BY created_at DESC 
+        LIMIT 1
+    ");
+    $noticeStmt->execute([$user_id]);
+    $gov_notice = $noticeStmt->fetch(PDO::FETCH_ASSOC);
+} catch(Exception $e) {
+    // Warnings table doesn't exist - use default
+}
+
+// Default notice if none in DB
+if (!$gov_notice) {
+    $gov_notice = [
+        'message' => 'Regular grid maintenance is scheduled for Sector 12 today. Please report any unexpected outages immediately.',
+        'created_at' => date('Y-m-d H:i:s')
+    ];
 }
 ?>
 
@@ -196,7 +280,7 @@ if(empty($ticker_news)) {
         .wc-icon { font-size: 2.8rem; color: #F8FAFC; opacity: 0.9; }
 
         .notice-card {
-            background: #FEF3C7; /* Warning Yellow background */
+            background: #FEF3C7;
             border-left: 5px solid #F59E0B;
             padding: 20px;
             margin-bottom: 25px;
@@ -343,9 +427,9 @@ if(empty($ticker_news)) {
                     <div class="notice-body">
                         <strong>Official Broadcast:</strong>
                         <br>
-                        Regular grid maintenance is scheduled for Sector 12 today. Please report any unexpected outages immediately.
+                        <?= htmlspecialchars($gov_notice['message']) ?>
                         <br><br>
-                        <span style="font-size:0.75rem; opacity:0.8;">Issued: <?= date('F j, Y') ?></span>
+                        <span style="font-size:0.75rem; opacity:0.8;">Issued: <?= date('F j, Y', strtotime($gov_notice['created_at'])) ?></span>
                     </div>
                 </div>
 
@@ -408,7 +492,7 @@ if(empty($ticker_news)) {
         </div>
     </div>
 
-    <footer class="footer">© 2026 Dhaka Grid Control. Connecting citizens.</footer>
+    <footer class="footer">© 2026 Dhaka Grid Control. Connecting citizens.Made with ❤️ by Injabin</footer>
 
     <div id="sosModal" class="modal">
         <div class="modal-content">
@@ -442,9 +526,8 @@ if(empty($ticker_news)) {
 
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
     <script>
-        // --- 1. REAL WEATHER JS (Client Side) ---
+        // --- REAL WEATHER API (Open-Meteo - Free, No Key) ---
         function fetchWeather() {
-            // Open-Meteo API for Dhaka (No Key Required, Free)
             fetch('https://api.open-meteo.com/v1/forecast?latitude=23.8103&longitude=90.4125&current=temperature_2m,is_day,weather_code&timezone=auto')
             .then(response => response.json())
             .then(data => {
@@ -455,21 +538,24 @@ if(empty($ticker_news)) {
                 document.getElementById('w-temp').innerText = temp + "°C";
                 document.getElementById('w-desc').innerText = "Dhaka, BD";
                 
-                // Map Code to Icon
+                // Map WMO Weather Code to Icon
                 let iconClass = "fa-cloud";
                 if(code === 0) iconClass = isDay ? "fa-sun" : "fa-moon";
                 else if(code <= 3) iconClass = isDay ? "fa-cloud-sun" : "fa-cloud-moon";
-                else if(code >= 51) iconClass = "fa-cloud-rain";
+                else if(code >= 51 && code <= 67) iconClass = "fa-cloud-rain";
+                else if(code >= 80) iconClass = "fa-cloud-showers-heavy";
                 
                 document.getElementById('w-icon').innerHTML = `<i class="fa-solid ${iconClass}"></i>`;
             })
             .catch(err => {
-                document.getElementById('w-temp').innerText = "--";
+                document.getElementById('w-temp').innerText = "--°C";
+                document.getElementById('w-desc').innerText = "Weather unavailable";
+                document.getElementById('w-icon').innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i>';
             });
         }
-        fetchWeather(); // Run immediately
+        fetchWeather();
 
-        // --- 2. TICKER ---
+        // --- NEWS TICKER (Real DB Data) ---
         const newsData = <?= json_encode($ticker_news) ?>;
         const wrapper = document.getElementById('newsWrapper');
         let currentNewsIdx = 0;
@@ -491,7 +577,7 @@ if(empty($ticker_news)) {
         setInterval(showNextNews, 4500);
         showNextNews();
 
-        // --- 3. MAP ---
+        // --- MAP (Real DB Coordinates) ---
         const map = L.map('map', {
             center: [23.7806, 90.4193],
             zoom: 12,
@@ -499,15 +585,19 @@ if(empty($ticker_news)) {
         });
         L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '' }).addTo(map);
 
-        <?php foreach($mapReports as $r): if(!empty($r['latitude'])): ?>
+        <?php foreach($mapReports as $r): if(!empty($r['latitude']) && !empty($r['longitude'])): 
+            $isSOS = (strtoupper($r['category']) === 'SOS');
+        ?>
             L.circleMarker([<?= $r['latitude'] ?>, <?= $r['longitude'] ?>], {
                 radius: 8,
-                fillColor: "<?= ($r['category'] == 'SOS' ? '#EF4444' : '#0F172A') ?>",
-                color: "white", weight: 2, fillOpacity: 0.9
-            }).addTo(map);
+                fillColor: "<?= $isSOS ? '#EF4444' : '#0F172A' ?>",
+                color: "white", 
+                weight: 2, 
+                fillOpacity: 0.9
+            }).bindPopup('<strong><?= htmlspecialchars($r['category']) ?></strong><br><small><?= date('M d, h:i A', strtotime($r['created_at'])) ?></small>').addTo(map);
         <?php endif; endforeach; ?>
 
-        // --- 4. CHART ---
+        // --- CHART (Real Category Data) ---
         const ctx = document.getElementById('myChart').getContext('2d');
         const chartDataRaw = [<?= implode(',', $chartData) ?>];
         const finalChartData = chartDataRaw.every(item => item === 0) ? [1] : chartDataRaw;
@@ -519,12 +609,30 @@ if(empty($ticker_news)) {
                 labels: ['Traffic', 'Water', 'Waste', 'SOS', 'Other'],
                 datasets: [{ data: finalChartData, backgroundColor: finalColors, borderWidth: 0 }]
             },
-            options: { cutout: '75%', plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, font: {size: 11} } } } }
+            options: { 
+                cutout: '75%', 
+                plugins: { 
+                    legend: { 
+                        position: 'bottom', 
+                        labels: { 
+                            usePointStyle: true, 
+                            font: {size: 11} 
+                        } 
+                    } 
+                } 
+            }
         });
 
-        // --- 5. SOS & GPS ---
-        function openSOS() { document.getElementById('sosModal').style.display = 'flex'; document.getElementById('step1').style.display = 'block'; }
-        function closeSOS() { document.getElementById('sosModal').style.display = 'none'; document.getElementById('stepError').style.display = 'none'; }
+        // --- SOS & GPS (Real Location Capture) ---
+        function openSOS() { 
+            document.getElementById('sosModal').style.display = 'flex'; 
+            document.getElementById('step1').style.display = 'block'; 
+        }
+        
+        function closeSOS() { 
+            document.getElementById('sosModal').style.display = 'none'; 
+            document.getElementById('stepError').style.display = 'none'; 
+        }
         
         function initSOS() {
             document.getElementById('step1').style.display = 'none';
@@ -532,11 +640,17 @@ if(empty($ticker_news)) {
 
             if ("geolocation" in navigator) {
                 navigator.geolocation.getCurrentPosition(
-                    function(position) { sendSOSData(position.coords.latitude, position.coords.longitude); },
-                    function(error) { showError("GPS Access Denied."); },
+                    function(position) { 
+                        sendSOSData(position.coords.latitude, position.coords.longitude); 
+                    },
+                    function(error) { 
+                        showError("GPS Access Denied. Enable location services."); 
+                    },
                     { enableHighAccuracy: true, timeout: 10000 }
                 );
-            } else { showError("Browser not supported."); }
+            } else { 
+                showError("Browser does not support GPS."); 
+            }
         }
 
         function sendSOSData(lat, lng) {
@@ -551,9 +665,11 @@ if(empty($ticker_news)) {
                 if(data.status === 'success') {
                     document.getElementById('step2').style.display = 'none';
                     document.getElementById('step3').style.display = 'block';
-                } else { showError(data.message); }
+                } else { 
+                    showError(data.message || 'Failed to send SOS alert'); 
+                }
             })
-            .catch(err => showError("Network Error"));
+            .catch(err => showError("Network Error. Please try again."));
         }
 
         function showError(msg) {
